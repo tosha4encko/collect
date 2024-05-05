@@ -3,64 +3,57 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Optional, List, Callable, Dict
 
-from collect_core import Meta, RunOpt, InstrumentsCollector
-from data_models import InstrumentsModel
-from .categories import Categories
+from core.collect_core import RunOpt, INSTRUMENT_TYPE, Collector
+from core.data_models import InstrumentsModel, MarketTypes
 from .client import request
-from collectors_container import collectors_container
-from .meta import meta_opt
+from core.collectors_container import collectors_container
+from .meta_opt import meta_opt
 
 _endpoint = '/v5/market/instruments-info'
 
 
 @dataclasses.dataclass
 class InstrumentsContext:
-    market_id: int
-    wallet_id: int
     contract_payout: Callable[[dict], Optional[str]]
     asset_contract: Callable[[dict], Optional[str]]
     increment_size: Callable[[dict], Optional[Decimal]]
 
 
-params_opt: Dict[Categories, dict] = {
-    Categories.SPOT: {
+params_opt: Dict[MarketTypes, dict] = {
+    MarketTypes.SPOT: {
         'category': 'spot',
         'limit': 100,
     },
-    Categories.LINEAR: {},
-    Categories.INVERSE: {},
-    Categories.OPTION: {
+    MarketTypes.LINEAR: {
+        'category': 'linear',
+    },
+    MarketTypes.OPTION: {
         'category': 'option',
         'status': 'Trading',
+    },
+    MarketTypes.INVERSE: {
+        'category': 'inverse',
     },
 }
 
 
-context_opt: Dict[Categories, InstrumentsContext] = {
-    Categories.SPOT: InstrumentsContext(
-        wallet_id=2,
-        market_id=1,
+context_opt: Dict[MarketTypes, InstrumentsContext] = {
+    MarketTypes.SPOT: InstrumentsContext(
         contract_payout=lambda resp: None,
         asset_contract=lambda resp: None,
         increment_size=lambda resp: Decimal(resp["lotSizeFilter"]["basePrecision"]),
     ),
-    Categories.LINEAR: InstrumentsContext(
-        wallet_id=2,
-        market_id=2,
+    MarketTypes.LINEAR: InstrumentsContext(
         contract_payout=lambda resp: "LINEAR",
         asset_contract=lambda resp: resp["baseCoin"],
         increment_size=lambda resp: Decimal(resp["lotSizeFilter"]["qtyStep"]),
     ),
-    Categories.INVERSE: InstrumentsContext(
-        wallet_id=2,
-        market_id=2,
+    MarketTypes.INVERSE: InstrumentsContext(
         contract_payout=lambda resp: 'INVERSE',
         asset_contract=lambda resp: resp["baseCoin"],
         increment_size=lambda resp: Decimal(resp["lotSizeFilter"]["qtyStep"]),
     ),
-    Categories.OPTION: InstrumentsContext(
-        wallet_id=2,
-        market_id=4,
+    MarketTypes.OPTION: InstrumentsContext(
         contract_payout=lambda resp: None,
         asset_contract=lambda resp: None,
         increment_size=lambda resp: Decimal(resp["lotSizeFilter"]["qtyStep"]),
@@ -73,7 +66,7 @@ status_map = {"Trading": 1, "Settling": 2, "Closed": 3, "PreLaunch": 2, "Deliver
 
 async def read(params: dict) -> List[dict]:
     response = await request(
-        url=_endpoint,
+        endpoint=_endpoint,
         opt={"method": 'GET', "params": params},
     )
     result = response["result"]["list"]
@@ -81,13 +74,10 @@ async def read(params: dict) -> List[dict]:
     return result
 
 
-def serialize(ctx: InstrumentsContext, meta: Meta, responses: List[dict]):
+def serialize(ctx: InstrumentsContext, responses: List[dict]):
     return [InstrumentsModel(
-        ts_insert=datetime.utcnow(),
-        ts=datetime.utcnow(),
-        exchange_id=meta.id,
-        wallet_id=ctx.wallet_id,
-        market_id=ctx.market_id,
+        ts_insert=datetime.now(),
+        ts=datetime.now(),
         contract_payout=ctx.contract_payout(response),
         asset_contract=ctx.asset_contract(response),
         status_id=status_map[response["status"]],
@@ -108,11 +98,10 @@ async def send(instruments: list[InstrumentsModel]):
     print(instruments)
 
 
-for category in Categories:
-    collectors_container.register(InstrumentsCollector(
-        type='instrument',
-        read=lambda: read(params_opt[category]),
-        serialize=lambda responses: serialize(context_opt[category], meta_opt[category], responses),
+for category in MarketTypes:
+    collectors_container.register(INSTRUMENT_TYPE, Collector(
+        read=lambda cat=category: read(params_opt[cat]),
+        serialize=lambda responses, cat=category: serialize(context_opt[cat], responses),
         send=send,
         meta=meta_opt[category],
         run_opt=RunOpt(period=60, interval=timedelta(seconds=60)),

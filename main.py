@@ -1,14 +1,18 @@
 import asyncio
 
-from collectors_container import CollectorBuilder, collectors_container
-from collectors import *
+from core.collect_core import Collector
+from core.collectors_container import collectors_container
 
 
-async def collect(collector: CollectorBuilder):
+async def collect(collector: Collector):
     while True:
+        # place for log
         exchange_data = await collector.read()
+        # place for log
         serialized_data = collector.serialize(exchange_data)
+        # place for log
         await collector.send(serialized_data)
+        # place for log
 
         await asyncio.sleep(collector.run_opt.period)
 

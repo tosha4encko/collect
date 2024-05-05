@@ -1,98 +1,106 @@
+from decimal import Decimal
+from typing import *
 import asyncio
 import dataclasses
-from datetime import timedelta, datetime
-from decimal import Decimal
-from typing import List, override
+from datetime import datetime, timedelta
 
+from core.collect_core import RunOpt, INSTRUMENT_TYPE, Collector, CANDLE_TYPE
+from core.collect_utils import get_collection_result
 from collectors.bybit.client import request
-from collectors_container import CollectorMeta, collectors_container, CollectorBuilder, CandlesCollector, \
-    InstrumentsCollector, get_collection_result
-from data_models import CandlesModel, InstrumentsModel
+from collectors.bybit.meta_opt import meta_opt
+from core.collectors_container import collectors_container
+from core.data_models import InstrumentsModel, CandlesModel, MarketTypes
 from timestamp_format import timestamp_format
+from send.send_to_kafka import create_kafka_sender
 
-_meta = CollectorMeta(
-    type='candles',
-    id=1,
-    class_id=1,
-    period=60,
-    interval=timedelta(minutes=10)
-)
+
 _endpoint = '/v5/market/kline'
+runOpt = RunOpt(period=60, interval=timedelta(minutes=60))
 
 
 @dataclasses.dataclass
-class CandlesContext:
-    category: str
-    market_id: int
-    wallet_id: int
+class CandlesCtx:
+    volume_base: Callable[[dict], str]
+    volume_quote: Callable[[dict], str]
+    category: MarketTypes
 
 
-async def read_with_instruments(instrument: InstrumentsModel):
-    date_from, date_to = self.time_bracket
-    limit = 200
+context_opt: Dict[MarketTypes, CandlesCtx] = {
+    MarketTypes.SPOT: CandlesCtx(
+        category=MarketTypes.SPOT,
+        volume_base=lambda response: response["volume"],
+        volume_quote=lambda response: response["turnover"],
+    ),
+    MarketTypes.LINEAR: CandlesCtx(
+        category=MarketTypes.LINEAR,
+        volume_base=lambda response: response["volume"],
+        volume_quote=lambda response: response["turnover"],
+    ),
+    MarketTypes.INVERSE: CandlesCtx(
+        category=MarketTypes.INVERSE,
+        volume_base=lambda response: response["turnover"],
+        volume_quote=lambda response: response["volume"],
+    ),
+}
+
+
+async def read_with_instruments(ctx: CandlesCtx, interval: timedelta, instrument: InstrumentsModel):
     params = {
-        "category": 'spot',
+        "category": ctx.category.value,
         "symbol": instrument.instrument_exch,
-        "start": datetime.now() - _meta.interval,
-        "end": datetime.now(),
-        "interval": '1m',
-        "limit": limit,
+        "start": int((datetime.now() - interval).timestamp()*1000),
+        "end": int(datetime.now().timestamp()*1000),
+        "interval": 60,
+        "limit": 200,
     }
-    return await request(endpoint=_endpoint, opt={"method": 'GET'})
+
+    return await request(_endpoint, opt={"method": 'GET', 'params': params})
 
 
-async def read_instruments(exch_id: int, class_id: int):
-    instruments_collector = collectors_container.get(
-        types='instruments',
-        id=exch_id,
-        classe_id=class_id
-    )
-    return await get_collection_result(instruments_collector)
+async def read(ctx: CandlesCtx, interval: timedelta, instr_collector: Collector[dict, InstrumentsModel]) -> List[dict]:
+    instruments = await get_collection_result(instr_collector)
+    tasks = [read_with_instruments(ctx, interval, instrument) for instrument in instruments[:10]]
+    res: List[dict] = [*await asyncio.gather(*tasks)]
+
+    return res
 
 
-async def read():
-    instruments = await read_instruments(_meta.id, _meta.class_id)
-    for instrument in instruments:
-        read_with_instruments(instrument)
-
-
-
-
-_market_map = {"spot": 1, "linear": 2, "inverse": 3}
 _data_mapping = ["startTime", "openPrice", "highPrice", "lowPrice", "closePrice", "volume", "turnover"]
 
 
-async def serialize(ctx: CandlesContext, data: dict):
+def serialize(ctx: CandlesCtx, data: List[dict]):
     results = []
-    instrument_exch = data["result"]["symbol"]
-    data = data["result"]["list"]
-
-    for resp in data:
-        response = dict(zip(_data_mapping, resp))
-        volume_base = response["volume"] if ctx.category != "inverse" else response["turnover"]
-        volume_quote = response["turnover"] if ctx.category != "inverse" else response["volume"]
-
-        result = CandlesModel(
-            exchange_id=_meta.id,
-            wallet_id=ctx.wallet_id,
-            market_id=ctx.market_id,
-            instrument_exch=instrument_exch,
-            ts=timestamp_format(int(response["startTime"]) / 1000),
-            type_candle=ctx.type_candle,
-            open=Decimal(response["openPrice"]),
-            high=Decimal(response["highPrice"]),
-            low=Decimal(response["lowPrice"]),
-            close=Decimal(response["closePrice"]),
-            volume_base=volume_base,
-            volume_quote=volume_quote,
-            response=resp,
-        )
-        results.append(result)
+    for item in data:
+        instrument_exch = item["result"]["symbol"]
+        responses = item["result"]["list"]
+        for resp in responses:
+            response = dict(zip(_data_mapping, resp))
+            result = CandlesModel(
+                instrument_exch=instrument_exch,
+                ts=timestamp_format(int(response["startTime"]) / 1000),
+                type_candle='1h',
+                open=Decimal(response["openPrice"]),
+                high=Decimal(response["highPrice"]),
+                low=Decimal(response["lowPrice"]),
+                close=Decimal(response["closePrice"]),
+                volume_base=Decimal(ctx.volume_base(response)),
+                volume_quote=Decimal(ctx.volume_quote(response)),
+                response=resp,
+            )
+            results.append(result)
     return results
 
 
-async def send(data: List[CandlesModel]):
-    pass
+sender = create_kafka_sender()
 
 
-# collectors_container.register(CollectorBuilder(read=read, serialize=serialize, send=send, meta=_meta))
+for category in MarketTypes:
+    if category != MarketTypes.OPTION:
+        instruments_collector = collectors_container.get(INSTRUMENT_TYPE, meta_opt[category])
+        collectors_container.register(CANDLE_TYPE, Collector(
+            read=lambda cat=category: read(context_opt[cat], runOpt.interval, instruments_collector),
+            serialize=lambda responses, cat=category: serialize(context_opt[cat], responses),
+            send=sender,
+            meta=meta_opt[category],
+            run_opt=runOpt,
+        ))
